@@ -7,7 +7,10 @@
 ```dotenv
 BOT_TOKEN=<your_bot_token>
 DEBUG_ID=<your_tg_id>  # не обязательно, нужно для использования команды /debug
+DB_URL=sqlite:///<database_file_name>
 ```
+
+**You can use any database, just configure the [DB_URL](https://docs.sqlalchemy.org/en/20/core/engines.html#database-urls)*
 
 ## Запуск при помощи docker compose
 

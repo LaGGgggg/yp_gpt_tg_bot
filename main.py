@@ -1,56 +1,32 @@
-from os import environ
-from dotenv import load_dotenv
 from random import choice
-from logging import Logger
 
 from telebot import TeleBot, types, custom_filters
 from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
 
-from user_info import UserInfoManager
 from gpt import GPT, get_prompt_tokens_amount
-from settings import REQUEST_MAX_TOKENS, WARNING_LOG_FILE_PATH
+from settings import (
+    REQUEST_MAX_TOKENS, WARNING_LOG_FILE_PATH, ROLE_CHOICES, SUBJECT_CHOICES_VERBOSE_NAMES,
+    DIFFICULT_CHOICES_VERBOSE_NAMES, SYSTEM_PROMPT_START, SUBJECT_CHOICES_VERBOSE_NAMES_TO_SUBJECTS,
+    DIFFICULT_CHOICES_VERBOSE_NAMES_TO_DIFFICULTS, DIFFICULT_CHOICES_DB_VALUES_TO_DIFFICULTS,
+    SUBJECT_CHOICES_DB_VALUES_TO_SUBJECTS, ROLE_CHOICES_ROLE_BY_DB_VALUE, set_up_env_var
+)
 from get_logger import get_logger
-
-
-BOT_TOKEN: str
-DEBUG_ID: int
+from database import SessionLocal, create_all_tables
+from crud import UserCrud, HistoryRecordCrud
+from models import HistoryRecord
 
 
 class ChatStates(StatesGroup):
 
-    chat = State()
     not_chat = State()
+    set_subject = State()
+    set_difficult = State()
+    chat = State()
 
 
-def set_up(logger: Logger) -> bool:
-
-    global BOT_TOKEN, DEBUG_ID
-
-    # Environment variables:
-
-    load_dotenv()
-
-    BOT_TOKEN = environ.get('BOT_TOKEN', default=None)
-
-    if not BOT_TOKEN:
-
-        logger.error('BOT_TOKEN environment variable is not set!')
-
-        return False
-
-    DEBUG_ID = environ.get('DEBUG_ID', default=None)
-
-    if not DEBUG_ID:
-
-        logger.warning('DEBUG_ID environment variable is not set, you cannot use /debug')
-
-        DEBUG_ID = 0
-
-    else:
-        DEBUG_ID = int(DEBUG_ID)
-
-    return True
+BOT_TOKEN: str
+DEBUG_ID: int
 
 
 def run_bot() -> None:
@@ -74,6 +50,20 @@ def run_bot() -> None:
     chat_markup.add(help_button)
     chat_markup.add(types.KeyboardButton(text=f'/{end_chat_command}'))
 
+    set_subject_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+
+    set_subject_markup.add(help_button)
+
+    for subject_verbose_name in SUBJECT_CHOICES_VERBOSE_NAMES:
+        set_subject_markup.add(types.KeyboardButton(text=subject_verbose_name))
+
+    set_difficult_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+
+    set_difficult_markup.add(help_button)
+
+    for difficult_verbose_name in DIFFICULT_CHOICES_VERBOSE_NAMES:
+        set_difficult_markup.add(types.KeyboardButton(text=difficult_verbose_name))
+
     @bot.message_handler(commands=[help_command, 'start'])
     def help_handler(message: types.Message):
 
@@ -95,13 +85,18 @@ def run_bot() -> None:
 
         bot.reply_to(message, reply_message, parse_mode='HTML', reply_markup=reply_markup)
 
-    @bot.message_handler(commands=[end_chat_command], state=ChatStates.chat)
+    @bot.message_handler(
+        commands=[end_chat_command], state=[ChatStates.chat, ChatStates.set_subject, ChatStates.set_difficult]
+    )
     def end_chat(message: types.Message):
 
         bot.set_state(message.from_user.id, ChatStates.not_chat, message.chat.id)
 
-        with UserInfoManager(message.from_user.id) as user_info_manager:
-            user_info_manager.update_user_data([])
+        with SessionLocal() as db:
+
+            user = UserCrud(db).get(telegram_id=message.from_user.id)
+
+            HistoryRecordCrud(db).delete_many(user=user)
 
         bot.reply_to(
             message,
@@ -133,22 +128,99 @@ def run_bot() -> None:
 
             return
 
-        with UserInfoManager(message.from_user.id) as user_info_manager:
+        with SessionLocal() as db:
 
-            gpt = GPT(user_info_manager.get_user_data())
+            user = UserCrud(db).get(telegram_id=message.from_user.id)
 
-            gpt_answer = gpt.ask(message_text)
+            messages_history_db: list[HistoryRecord] = HistoryRecordCrud(db).get_many(user=user)
 
-            user_info_manager.update_user_data(gpt.previous_messages)
+            messages_history = []
+
+            for message_history in messages_history_db:
+                messages_history.append(
+                    {'role': ROLE_CHOICES_ROLE_BY_DB_VALUE[message_history.role], 'content': message_history.message}
+                )
+
+            system_prompt = (
+                    SYSTEM_PROMPT_START + SUBJECT_CHOICES_DB_VALUES_TO_SUBJECTS[user.subject]['gpt_prompt'] +
+                    DIFFICULT_CHOICES_DB_VALUES_TO_DIFFICULTS[user.difficult]['gpt_prompt']
+            )
+
+            gpt_answer = GPT(messages_history, system_prompt).ask(message_text)
+
+            HistoryRecordCrud(db).create(user=user, message=message_text, role=ROLE_CHOICES['user'])
+            HistoryRecordCrud(db).create(user=user, message=gpt_answer, role=ROLE_CHOICES['assistant'])
 
         bot.reply_to(message, gpt_answer, reply_markup=chat_markup)
 
     @bot.message_handler(commands=['new_chat'], state=ChatStates.not_chat)
     def new_chat(message: types.Message):
 
-        bot.set_state(message.from_user.id, ChatStates.chat, message.chat.id)
+        bot.set_state(message.from_user.id, ChatStates.set_subject, message.chat.id)
 
-        bot.reply_to(message, 'Напиши своё сообщение для GPT', reply_markup=chat_markup)
+        bot.reply_to(message, 'Выбери предмет', reply_markup=set_subject_markup)
+
+    @bot.message_handler(state=ChatStates.set_subject)
+    def process_set_subject(message: types.Message):
+
+        if message.text not in SUBJECT_CHOICES_VERBOSE_NAMES:
+
+            bot.reply_to(
+                message,
+                'Это не является корректным значением, пожалуйста, выберите ещё раз',
+                reply_markup=set_subject_markup,
+            )
+
+            return
+
+        user_id = message.from_user.id
+
+        with SessionLocal() as db:
+
+            user_crud = UserCrud(db)
+
+            subject_db_value = SUBJECT_CHOICES_VERBOSE_NAMES_TO_SUBJECTS[message.text]['db_value']
+
+            if user := user_crud.get(telegram_id=user_id):
+                user_crud.update(user, subject=subject_db_value)
+
+            else:
+                user_crud.create(telegram_id=user_id, subject=subject_db_value)
+
+        bot.set_state(user_id, ChatStates.set_difficult, message.chat.id)
+
+        bot.reply_to(message, 'Выбери сложность объяснения', reply_markup=set_difficult_markup)
+
+    @bot.message_handler(state=ChatStates.set_difficult)
+    def process_set_difficult(message: types.Message):
+
+        if message.text not in DIFFICULT_CHOICES_VERBOSE_NAMES:
+
+            bot.reply_to(
+                message,
+                'Это не является корректным значением, пожалуйста, выберите ещё раз',
+                reply_markup=set_difficult_markup,
+            )
+
+            return
+
+        user_id = message.from_user.id
+
+        with SessionLocal() as db:
+
+            user_crud = UserCrud(db)
+
+            difficult_db_value = DIFFICULT_CHOICES_VERBOSE_NAMES_TO_DIFFICULTS[message.text]['db_value']
+
+            if user := user_crud.get(telegram_id=user_id):
+                user_crud.update(user, difficult=difficult_db_value)
+
+            else:
+                user_crud.create(telegram_id=user_id, difficult=difficult_db_value)
+
+        bot.set_state(user_id, ChatStates.chat, message.chat.id)
+
+        bot.reply_to(message, 'Задайте свой вопрос GPT:', reply_markup=chat_markup)
 
     @bot.message_handler(commands=['debug'], func=lambda message: message.from_user.id == DEBUG_ID)
     def debug_handler(message: types.Message):
@@ -194,9 +266,16 @@ def run_bot() -> None:
 
 def main():
 
+    global BOT_TOKEN, DEBUG_ID
+
     logger = get_logger('main')
 
-    if set_up(logger):
+    DEBUG_ID = set_up_env_var('DEBUG_ID', logger.warning)
+
+    if BOT_TOKEN := set_up_env_var('BOT_TOKEN', logger.error):
+
+        create_all_tables()
+
         run_bot()
 
     else:
